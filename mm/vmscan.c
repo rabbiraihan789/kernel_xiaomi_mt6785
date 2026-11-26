@@ -57,6 +57,7 @@
 #include <linux/swapops.h>
 #include <linux/balloon_compaction.h>
 #include <linux/rtmm.h>
+#include <linux/simple_lmk.h>
 
 #include "internal.h"
 
@@ -84,6 +85,8 @@ struct scan_control {
 	 * primary target of this reclaim invocation.
 	 */
 	struct mem_cgroup *target_mem_cgroup;
+
+	int swappiness;
 
 	/* Scan (total_size >> priority) pages at once */
 	int priority;
@@ -158,7 +161,14 @@ struct scan_control {
 /*
  * From 0 .. 100.  Higher means more swappy.
  */
-int vm_swappiness = 80;
+#ifndef CONFIG_INCREASE_MAXIMUM_SWAPPINESS
+int vm_swappiness = 100;
+#else
+int vm_swappiness = 190;
+#endif
+#ifdef CONFIG_OPLUS_MM_HACKS
+int direct_vm_swappiness = 190;
+#endif
 /*
  * The total number of pages which are beyond the high watermark within all
  * zones.
@@ -1430,6 +1440,7 @@ unsigned long reclaim_pages_from_list(struct list_head *page_list,
 		.may_unmap = 1,
 		.may_swap = 1,
 		.target_vma = vma,
+		.swappiness = vm_swappiness,
 	};
 
 	unsigned long nr_reclaimed;
@@ -1819,6 +1830,10 @@ putback_inactive_pages(struct lruvec *lruvec, struct list_head *page_list)
  */
 static int current_may_throttle(void)
 {
+#ifdef CONFIG_OPLUS_MM_HACKS
+	if ((current->signal->oom_score_adj < 0))
+		return 0;
+#endif
 	return !(current->flags & PF_LESS_THROTTLE) ||
 		current->backing_dev_info == NULL ||
 		bdi_write_congested(current->backing_dev_info);
@@ -2187,12 +2202,14 @@ static bool inactive_list_is_low(struct lruvec *lruvec, bool file,
 				 struct scan_control *sc, bool trace)
 {
 	enum lru_list active_lru = file * LRU_FILE + LRU_ACTIVE;
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	enum lru_list inactive_lru = file * LRU_FILE;
 	unsigned long inactive, active;
 	unsigned long inactive_ratio;
+#ifndef CONFIG_FIX_INACTIVE_RATIO
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	unsigned long refaults;
 	unsigned long gb;
+#endif
 
 	/*
 	 * If we don't have swap space, anonymous page deactivation
@@ -2204,6 +2221,9 @@ static bool inactive_list_is_low(struct lruvec *lruvec, bool file,
 	inactive = lruvec_lru_size(lruvec, inactive_lru, sc->reclaim_idx);
 	active = lruvec_lru_size(lruvec, active_lru, sc->reclaim_idx);
 
+#ifdef CONFIG_FIX_INACTIVE_RATIO
+	inactive_ratio = 1;
+#else
 	/*
 	 * When refaults are being observed, it means a new workingset
 	 * is being established. Disable active list protection to get
@@ -2214,17 +2234,22 @@ static bool inactive_list_is_low(struct lruvec *lruvec, bool file,
 		inactive_ratio = 0;
 	} else {
 		gb = (inactive + active) >> (30 - PAGE_SHIFT);
+#ifdef CONFIG_OPLUS_MM_HACKS
+		if (file && gb)
+			inactive_ratio = min(2UL, int_sqrt(10 * gb));
+#else
 		if (gb)
 			inactive_ratio = int_sqrt(10 * gb);
+#endif
 		else
 			inactive_ratio = 1;
 	}
-
 	if (trace)
 		trace_mm_vmscan_inactive_list_is_low(pgdat->node_id, sc->reclaim_idx,
 			lruvec_lru_size(lruvec, inactive_lru, MAX_NR_ZONES), inactive,
 			lruvec_lru_size(lruvec, active_lru, MAX_NR_ZONES), active,
 			inactive_ratio, file);
+#endif
 
 	return inactive * inactive_ratio < active;
 }
@@ -2319,9 +2344,18 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
 	unsigned long anon, file;
 	unsigned long ap, fp;
 	enum lru_list lru;
+#ifdef CONFIG_OPLUS_MM_HACKS
+	unsigned long totalswap = total_swap_pages;
+#endif
 
+#ifdef CONFIG_OPLUS_MM_HACKS
+	if (!current_is_kswapd())
+		swappiness = direct_vm_swappiness;
+	if (!sc->may_swap || (mem_cgroup_get_nr_swap_pages(memcg) <= totalswap>>6)) {
+#else
 	/* If we have no swap space, do not bother scanning anon pages. */
 	if (!sc->may_swap || mem_cgroup_get_nr_swap_pages(memcg) <= 0) {
+#endif
 		scan_balance = SCAN_FILE;
 		goto out;
 	}
@@ -2833,6 +2867,9 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			   sc->nr_scanned - nr_scanned,
 			   sc->nr_reclaimed - nr_reclaimed);
 
+		if (global_reclaim(sc) && sc->priority < DEF_PRIORITY / 2)
+			simple_lmk_reclaim_needed();
+
 		if (sc->nr_reclaimed - nr_reclaimed)
 			reclaimable = true;
 
@@ -3224,7 +3261,16 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 		.priority = DEF_PRIORITY,
 		.may_writepage = !laptop_mode,
 		.may_unmap = 1,
+#ifdef CONFIG_DIRECT_RECLAIM_FILE_PAGES_ONLY
+		.may_swap = 0,
+#else
 		.may_swap = 1,
+#endif
+#ifdef CONFIG_ZSWAP
+		.swappiness = vm_swappiness / 2,
+#else
+		.swappiness = vm_swappiness,
+#endif
 	};
 
 	/*
